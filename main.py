@@ -1,353 +1,368 @@
 """
-main.py — Soccer Stars Analyzer  (Android entry point)
-=======================================================
-Kivy 2.3.0 application.
+service/main.py — Android Background Capture Service
+=====================================================
+Entry point for the python-for-android foreground service.
 
-Responsibilities
-----------------
-1. Request all Android runtime permissions on first launch.
-2. Present a MediaProjection consent dialog (screen-capture permission).
-3. Home screen  : Start/Stop overlay, Auto-detect ON/OFF, HSV Settings.
-4. Settings screen (HSVTunerScreen): live colour calibration for the engine.
-5. Manage FloatingOverlayManager lifetime and propagate app pause/resume
-   to the background capture service (battery-saving hibernate/wake cycle).
+Architecture
+------------
+  MediaProjection → ScreenCaptureManager → BGR frames
+       │                                        │
+       │                                        ▼ (active mode)
+       │                              analyse_frame()
+       │                                        │ JSON result
+       │                                        ▼
+       │                              UDP 54321 → overlay
+       │
+       └──(hibernate mode)──► check_turn() every 0.5 s
+                                        │ if turn detected
+                                        ▼
+                              wake_until_holder set → re-enter active mode
 
-Compatibility
--------------
-- Kivy 2.3.0   (Python 3.11, arm64-v8a)
-- Android API 26–34
-- Degrades gracefully on desktop (skips all Android-specific code paths).
+Power states
+------------
+  ACTIVE    : capture → analyse_frame() → broadcast, capped at 15 FPS.
+  HIBERNATE : drain ImageReader; run check_turn() every 0.5 s;
+              auto-wake for WAKE_HOLD_SECONDS when a turn is detected.
+  WAKE GRANT: "wake" UDP command overrides HIBERNATE for WAKE_HOLD_SECONDS.
+              Fired by overlay button touch-down.
 
-Run on device
--------------
-    buildozer android debug deploy run
+IPC commands (UDP 54322)
+------------------------
+  set_hsv         {"cmd":"set_hsv","prefs":{...}}
+  set_power       {"cmd":"set_power","state":"active"|"hibernate"}
+  wake            {"cmd":"wake"}
+  set_scale       {"cmd":"set_scale","factor":float}
+  set_auto_detect {"cmd":"set_auto_detect","enabled":bool}
 """
 
 from __future__ import annotations
-import os
 import json
+import os
+import sys
+import socket
+import threading
+import time
+import numpy as np
+from kivy.logger import Logger
 
-from kivy.app              import App
-from kivy.uix.boxlayout   import BoxLayout
-from kivy.uix.button      import Button
-from kivy.uix.label       import Label
-from kivy.uix.screenmanager import ScreenManager, Screen
-from kivy.uix.popup       import Popup
-from kivy.logger          import Logger
-
-IS_ANDROID = (
-    os.environ.get("ANDROID_ARGUMENT") is not None
-    or os.path.exists("/system/build.prop")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from analyzer import (
+    AnalyzerConfig, TurnDetectorConfig, TurnDetector,
+    analyse_frame, check_turn,
 )
 
+IS_ANDROID = os.path.exists("/system/build.prop")
+
+IPC_OVERLAY_PORT = 54321
+IPC_SERVICE_PORT = 54322
+
+NOTIFICATION_ID = 1001
+CHANNEL_ID      = "SoccerStarsChannel"
+
+# ---------------------------------------------------------------------------
+# Power constants
+# ---------------------------------------------------------------------------
+TARGET_FPS          = 15
+FRAME_INTERVAL      = 1.0 / TARGET_FPS
+HIBERNATE_INTERVAL  = 0.5
+WAKE_HOLD_SECONDS   = 3.0
+TURN_CHECK_INTERVAL = 0.5
+
+POWER_ACTIVE    = "active"
+POWER_HIBERNATE = "hibernate"
+
+# ---------------------------------------------------------------------------
+# Android imports
+# ---------------------------------------------------------------------------
 if IS_ANDROID:
-    from android.permissions import request_permissions           # type: ignore
-    from android             import activity as _android_activity # type: ignore
-    from jnius               import autoclass, cast               # type: ignore
+    from jnius import autoclass, cast  # type: ignore
 
-    PythonActivity = autoclass("org.kivy.android.PythonActivity")
-
-from hsv_tuner import HSVTunerScreen
-from overlay   import FloatingOverlayManager
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-PREFS_FILE      = "hsv_prefs.json"
-MP_REQUEST_CODE = 100
-
-REQUIRED_PERMISSIONS = [
-    "android.permission.SYSTEM_ALERT_WINDOW",
-    "android.permission.FOREGROUND_SERVICE",
-    "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION",
-] if IS_ANDROID else []
+    PythonService  = autoclass("org.kivy.android.PythonService")
+    Handler        = autoclass("android.os.Handler")
+    Looper         = autoclass("android.os.Looper")
+    ImageReader    = autoclass("android.media.ImageReader")
+    DisplayMetrics = autoclass("android.util.DisplayMetrics")
+    Context        = autoclass("android.content.Context")
+    NotifChannel   = autoclass("android.app.NotificationChannel")
+    NotifBuilder   = autoclass("androidx.core.app.NotificationCompat$Builder")
 
 
 # ---------------------------------------------------------------------------
-# Home Screen
+# Notification
 # ---------------------------------------------------------------------------
 
-class HomeScreen(Screen):
-    """
-    Three controls on the home screen
-    ----------------------------------
-    Start / Stop Overlay   — launches or destroys the floating overlay.
-    Auto-detect ON / OFF   — toggles the 'your turn' auto-detector.
-    HSV Colour Settings    — navigates to the tuner screen.
-    """
+def _make_channel(ctx):
+    if not IS_ANDROID:
+        return
+    mgr = cast("android.app.NotificationManager",
+               ctx.getSystemService(Context.NOTIFICATION_SERVICE))
+    mgr.createNotificationChannel(NotifChannel(CHANNEL_ID, "Soccer Stars Analyzer", 2))
 
-    def __init__(self, app_ref: "SoccerStarsApp", **kwargs):
-        super().__init__(name="home", **kwargs)
-        self._app            = app_ref
-        self._overlay_active = False
-        self._auto_detect    = True
-        self._build_ui()
 
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
-
-    def _build_ui(self):
-        root = BoxLayout(orientation="vertical", padding=24, spacing=14)
-
-        root.add_widget(Label(
-            text="[b]Soccer Stars Analyzer[/b]",
-            markup=True, font_size="20sp",
-            size_hint=(1, 0.09), halign="center",
-        ))
-
-        self._status = Label(
-            text="Overlay: OFF  |  Auto-detect: ON",
-            font_size="12sp", size_hint=(1, 0.07),
-            halign="center", color=(0.7, 0.7, 0.7, 1),
-        )
-        root.add_widget(self._status)
-
-        # Overlay toggle
-        self._ov_btn = Button(
-            text="Start Overlay", font_size="16sp",
-            size_hint=(1, 0.17),
-            background_color=(0.18, 0.76, 0.28, 1),
-        )
-        self._ov_btn.bind(on_release=self._toggle_overlay)
-        root.add_widget(self._ov_btn)
-
-        # Auto-detect toggle
-        self._ad_btn = Button(
-            text="Auto-detect: ON", font_size="15sp",
-            size_hint=(1, 0.14),
-            background_color=(0.15, 0.55, 0.85, 1),
-        )
-        self._ad_btn.bind(on_release=self._toggle_auto_detect)
-        root.add_widget(self._ad_btn)
-
-        # HSV settings
-        hsv_btn = Button(
-            text="HSV Colour Settings", font_size="15sp",
-            size_hint=(1, 0.14),
-            background_color=(0.45, 0.25, 0.75, 1),
-        )
-        hsv_btn.bind(on_release=lambda *_: setattr(self.manager, "current", "hsv_tuner"))
-        root.add_widget(hsv_btn)
-
-        root.add_widget(Label(
-            text=(
-                "1. Tap [b]Start Overlay[/b] to launch the floating button.\n"
-                "2. Switch to Soccer Stars — the overlay stays on screen.\n"
-                "3. [b]Auto-detect[/b] wakes the engine when your turn begins.\n"
-                "4. Tap the floating button to show / hide the prediction line.\n"
-                "5. Touch-and-hold the button to drag it to any screen edge.\n\n"
-                "Grant SYSTEM_ALERT_WINDOW in Android Settings if prompted."
-            ),
-            markup=True, font_size="12sp", halign="center",
-            size_hint=(1, 0.39), color=(0.65, 0.65, 0.65, 1),
-        ))
-
-        self.add_widget(root)
-
-    # ------------------------------------------------------------------
-    # Handlers
-    # ------------------------------------------------------------------
-
-    def _toggle_overlay(self, *_):
-        if self._overlay_active:
-            self._app.stop_overlay()
-            self._ov_btn.text             = "Start Overlay"
-            self._ov_btn.background_color = (0.18, 0.76, 0.28, 1)
-        else:
-            self._app.start_overlay()
-            self._ov_btn.text             = "Stop Overlay"
-            self._ov_btn.background_color = (0.82, 0.18, 0.18, 1)
-        self._overlay_active = not self._overlay_active
-        self._refresh_status()
-
-    def _toggle_auto_detect(self, *_):
-        self._auto_detect = not self._auto_detect
-        self._app.set_auto_detect(self._auto_detect)
-        if self._auto_detect:
-            self._ad_btn.text             = "Auto-detect: ON"
-            self._ad_btn.background_color = (0.15, 0.55, 0.85, 1)
-        else:
-            self._ad_btn.text             = "Auto-detect: OFF"
-            self._ad_btn.background_color = (0.38, 0.38, 0.38, 1)
-        self._refresh_status()
-
-    def _refresh_status(self):
-        ov = "ON"  if self._overlay_active else "OFF"
-        ad = "ON"  if self._auto_detect    else "OFF"
-        self._status.text = f"Overlay: {ov}  |  Auto-detect: {ad}"
+def _make_notif(ctx):
+    return (NotifBuilder(ctx, CHANNEL_ID)
+            .setContentTitle("Soccer Stars Analyzer")
+            .setContentText("Overlay active — capturing screen")
+            .setSmallIcon(ctx.getResources().getIdentifier(
+                "ic_launcher", "mipmap", ctx.getPackageName()))
+            .build())
 
 
 # ---------------------------------------------------------------------------
-# Main Application
+# Screen capture
 # ---------------------------------------------------------------------------
 
-class SoccerStarsApp(App):
-    """
-    Kivy application lifecycle
-    --------------------------
-    on_start  → request permissions → request MediaProjection consent
-    on_pause  → hibernate service; return True (keep process alive)
-    on_resume → restore service
-    on_stop   → tear down overlay
-    """
+class ScreenCaptureManager:
+    """Wraps Android MediaProjection + ImageReader → BGR numpy frames."""
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._overlay: "FloatingOverlayManager | None" = None
-        self._mp_token                                 = None
-        self._auto_detect_enabled                      = True
-        self.hsv_prefs                                 = self._load_prefs()
+    def __init__(self, result_code, data_intent, width, height, density):
+        self._rc, self._di = result_code, data_intent
+        self.width, self.height, self._density = width, height, density
+        self._proj, self._ir, self._vd = None, None, None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def build(self):
-        sm = ScreenManager()
-        sm.add_widget(HomeScreen(app_ref=self))
-        sm.add_widget(HSVTunerScreen(app_ref=self))
-        return sm
-
-    def on_start(self):
-        if IS_ANDROID:
-            self._request_permissions()
-        else:
-            Logger.info("SoccerStars: desktop mode — Android setup skipped.")
-
-    def on_pause(self):
-        """
-        App sent to background (user switched to Soccer Stars).
-        Returning True keeps the process alive so the overlay persists.
-        Hibernating the service stops all OpenCV work → near-zero battery drain.
-        """
-        if self._overlay:
-            self._overlay.notify_background()
-        Logger.info("SoccerStars: paused — service hibernated.")
-        return True
-
-    def on_resume(self):
-        if self._overlay:
-            self._overlay.notify_foreground()
-        Logger.info("SoccerStars: resumed.")
-
-    def on_stop(self):
-        self.stop_overlay()
-
-    # ------------------------------------------------------------------
-    # Permissions
-    # ------------------------------------------------------------------
-
-    def _request_permissions(self):
-        request_permissions(REQUIRED_PERMISSIONS,
-                            callback=self._on_permissions)
-
-    def _on_permissions(self, permissions, grants):
-        denied = [p for p, g in zip(permissions, grants) if not g]
-        if denied:
-            Logger.warning(f"SoccerStars: denied: {denied}")
-            self._show_denied_popup(denied)
-        else:
-            Logger.info("SoccerStars: all permissions granted.")
-            self._request_media_projection()
-
-    def _show_denied_popup(self, denied: list):
-        body = BoxLayout(orientation="vertical", padding=12, spacing=8)
-        body.add_widget(Label(
-            text=("Permissions denied:\n" + "\n".join(denied) +
-                  "\n\nGo to: Android Settings → Apps → "
-                  "Soccer Stars Analyzer → Permissions"),
-            halign="center",
-        ))
-        btn = Button(text="OK", size_hint=(1, 0.28))
-        popup = Popup(title="Permissions Required",
-                      content=body, size_hint=(0.88, 0.52))
-        btn.bind(on_release=popup.dismiss)
-        body.add_widget(btn)
-        popup.open()
-
-    # ------------------------------------------------------------------
-    # MediaProjection
-    # ------------------------------------------------------------------
-
-    def _request_media_projection(self):
-        ctx = PythonActivity.mActivity
-        mgr = cast(
-            "android.media.projection.MediaProjectionManager",
-            ctx.getSystemService(ctx.MEDIA_PROJECTION_SERVICE),
-        )
-        ctx.startActivityForResult(mgr.createScreenCaptureIntent(), MP_REQUEST_CODE)
-        _android_activity.bind(on_activity_result=self._on_mp_result)
-
-    def _on_mp_result(self, req_code, result_code, data):
-        if req_code != MP_REQUEST_CODE:
+    def start(self):
+        if not IS_ANDROID:
+            Logger.info("ScreenCapture: no-op on non-Android.")
             return
-        if result_code == -1:          # Activity.RESULT_OK
-            self._mp_token = (result_code, data)
-            Logger.info("SoccerStars: MediaProjection granted.")
-        else:
-            Logger.warning("SoccerStars: MediaProjection denied by user.")
-
-    # ------------------------------------------------------------------
-    # Overlay control
-    # ------------------------------------------------------------------
-
-    def start_overlay(self):
-        if self._overlay is not None:
-            return
-        self._overlay = FloatingOverlayManager(
-            hsv_prefs=self.hsv_prefs,
-            media_projection_token=self._mp_token,
-            auto_detect_enabled=self._auto_detect_enabled,
+        ctx   = PythonService.mService
+        mpm   = cast("android.media.projection.MediaProjectionManager",
+                     ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE))
+        self._proj = mpm.getMediaProjection(self._rc, self._di)
+        self._ir   = ImageReader.newInstance(self.width, self.height, 1, 2)   # RGBA_8888
+        VD         = autoclass("android.hardware.display.VirtualDisplay")
+        self._vd   = self._proj.createVirtualDisplay(
+            "SoccerStarsCapture", self.width, self.height, self._density, 4,
+            self._ir.getSurface(), None, Handler(Looper.getMainLooper()),
         )
-        self._overlay.start()
-        Logger.info("SoccerStars: overlay started.")
+        Logger.info("ScreenCapture: started.")
 
-    def stop_overlay(self):
-        if self._overlay is not None:
-            self._overlay.stop()
-            self._overlay = None
-        Logger.info("SoccerStars: overlay stopped.")
-
-    def set_auto_detect(self, enabled: bool):
-        self._auto_detect_enabled = enabled
-        if self._overlay is not None:
-            self._overlay.set_auto_detect(enabled)
-
-    # ------------------------------------------------------------------
-    # HSV preferences
-    # ------------------------------------------------------------------
-
-    def _load_prefs(self) -> dict:
-        defaults = {
-            "ball":   {"h_lo": 0,   "s_lo": 0,   "v_lo": 200,
-                       "h_hi": 180, "s_hi": 40,  "v_hi": 255},
-            "player": {"h_lo": 100, "s_lo": 150, "v_lo": 100,
-                       "h_hi": 130, "s_hi": 255, "v_hi": 255},
-        }
-        if os.path.exists(PREFS_FILE):
-            try:
-                with open(PREFS_FILE) as fh:
-                    return json.load(fh)
-            except Exception:
-                pass
-        return defaults
-
-    def save_hsv_prefs(self, prefs: dict):
-        self.hsv_prefs = prefs
+    def acquire_bgr(self):
+        """Return one BGR frame or None if the buffer is empty."""
+        if not IS_ANDROID or self._ir is None:
+            return None
+        image = self._ir.acquireLatestImage()
+        if image is None:
+            return None
         try:
-            with open(PREFS_FILE, "w") as fh:
-                json.dump(prefs, fh)
+            planes = image.getPlanes()
+            buf    = planes[0].getBuffer()
+            rs, ps = planes[0].getRowStride(), planes[0].getPixelStride()
+            raw    = bytearray(buf.remaining())
+            buf.get(raw)
+            flat   = np.frombuffer(raw, dtype=np.uint8)
+            rgba   = flat.reshape((self.height, rs // ps, 4))[:, :self.width, :]
+            return np.ascontiguousarray(rgba[:, :, [2, 1, 0]])
+        finally:
+            image.close()
+
+    def drain(self):
+        """Discard the latest buffered frame (prevents buffer overflow in hibernate)."""
+        if not IS_ANDROID or self._ir is None:
+            return
+        try:
+            img = self._ir.acquireLatestImage()
+            if img:
+                img.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        if IS_ANDROID:
+            try:
+                if self._vd:   self._vd.release()
+                if self._proj: self._proj.stop()
+            except Exception as exc:
+                Logger.warning(f"ScreenCapture: stop error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# IPC command listener
+# ---------------------------------------------------------------------------
+
+def _cmd_listener(cfg_h, td_h, pwr_h, wake_h, stop_ev):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", IPC_SERVICE_PORT))
+    sock.settimeout(1.0)
+    Logger.info(f"Service: cmd listener on UDP {IPC_SERVICE_PORT}")
+
+    while not stop_ev.is_set():
+        try:
+            data, _ = sock.recvfrom(8192)
+            msg      = json.loads(data.decode())
+            cmd      = msg.get("cmd")
+
+            if cmd == "set_hsv":
+                cfg_h[0] = AnalyzerConfig.from_prefs(msg.get("prefs", {}))
+            elif cmd == "set_power":
+                pwr_h[0] = msg.get("state", POWER_ACTIVE)
+                Logger.info(f"Service: power → {pwr_h[0]}")
+            elif cmd == "wake":
+                wake_h[0] = time.monotonic() + WAKE_HOLD_SECONDS
+                Logger.info(f"Service: wake granted for {WAKE_HOLD_SECONDS}s")
+            elif cmd == "set_scale":
+                cfg_h[0].scale_factor = max(0.1, min(1.0, float(msg.get("factor", 0.5))))
+            elif cmd == "set_auto_detect":
+                td_h[0].enabled = bool(msg.get("enabled", True))
+                Logger.info(f"Service: auto_detect → {td_h[0].enabled}")
+
+        except socket.timeout:
+            continue
         except Exception as exc:
-            Logger.warning(f"SoccerStars: prefs save error: {exc}")
-        if self._overlay is not None:
-            self._overlay.update_hsv_prefs(prefs)
+            Logger.warning(f"Service cmd error: {exc}")
+
+    sock.close()
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _screen_dims():
+    if not IS_ANDROID:
+        return 1080, 1920, 480
+    ctx = PythonService.mService
+    wm  = cast("android.view.WindowManager",
+               ctx.getSystemService(Context.WINDOW_SERVICE))
+    dm  = DisplayMetrics()
+    wm.getDefaultDisplay().getRealMetrics(dm)
+    return dm.widthPixels, dm.heightPixels, dm.densityDpi
+
+
+def _parse_args():
+    try:
+        return json.loads(os.environ.get("PYTHON_SERVICE_ARGUMENT", "{}"))
+    except Exception:
+        return {}
+
+
+def _broadcast(sock, result):
+    sock.sendto(json.dumps(result).encode(), ("127.0.0.1", IPC_OVERLAY_PORT))
+
+
+# ---------------------------------------------------------------------------
+# Service main loop
+# ---------------------------------------------------------------------------
+
+def main():
+    Logger.info("SoccerStarsService: starting.")
+    args = _parse_args()
+
+    cfg_h  = [AnalyzerConfig.from_prefs(args.get("hsv_prefs", {}))]
+    td_h   = [TurnDetectorConfig.from_prefs(args.get("hsv_prefs", {}))]
+    pwr_h  = [POWER_ACTIVE]
+    wake_h = [0.0]
+
+    if args.get("auto_detect") is False:
+        td_h[0].enabled = False
+
+    detector = TurnDetector()
+
+    if IS_ANDROID:
+        ctx = PythonService.mService
+        _make_channel(ctx)
+        PythonService.mService.startForeground(NOTIFICATION_ID, _make_notif(ctx))
+
+    mp_rc  = int(os.environ.get("MP_RESULT_CODE", "-1"))
+    mp_data = os.environ.get("MP_DATA", None)
+    w, h, dpi = _screen_dims()
+
+    if IS_ANDROID and mp_rc != -1:
+        capture = ScreenCaptureManager(mp_rc, mp_data, w, h, dpi)
+        capture.start()
+    else:
+        Logger.info("SoccerStarsService: no MediaProjection — idle mode.")
+        capture = None
+
+    stop_ev = threading.Event()
+    threading.Thread(
+        target=_cmd_listener,
+        args=(cfg_h, td_h, pwr_h, wake_h, stop_ev),
+        daemon=True,
+    ).start()
+
+    out_sock             = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    last_frame_t         = 0.0
+    last_turn_check_t    = 0.0
+    sent_hibernate_clear = False
+
+    try:
+        while not stop_ev.is_set():
+            now         = time.monotonic()
+            wake_active = now < wake_h[0]
+            is_active   = (pwr_h[0] == POWER_ACTIVE) or wake_active
+
+            # ----------------------------------------------------------------
+            # HIBERNATE
+            # ----------------------------------------------------------------
+            if not is_active:
+                if not sent_hibernate_clear:
+                    _broadcast(out_sock, {
+                        "waypoints": [], "ball": None, "player": None,
+                        "turn_detected": False, "hibernating": True,
+                    })
+                    sent_hibernate_clear = True
+                    Logger.info("SoccerStarsService: hibernating.")
+
+                if capture is not None:
+                    capture.drain()
+
+                if (capture is not None
+                        and td_h[0].enabled
+                        and now - last_turn_check_t >= TURN_CHECK_INTERVAL):
+                    last_turn_check_t = now
+                    frame = capture.acquire_bgr()
+                    if frame is not None and check_turn(frame, cfg_h[0], td_h[0], detector):
+                        wake_h[0] = now + WAKE_HOLD_SECONDS
+                        Logger.info("TurnDetector: your turn — waking engine.")
+                        _broadcast(out_sock, {
+                            "waypoints": [], "ball": None, "player": None,
+                            "turn_detected": True, "hibernating": False,
+                        })
+                        sent_hibernate_clear = False
+                        continue
+
+                time.sleep(HIBERNATE_INTERVAL)
+                continue
+
+            # ----------------------------------------------------------------
+            # ACTIVE
+            # ----------------------------------------------------------------
+            sent_hibernate_clear = False
+
+            elapsed = now - last_frame_t
+            if elapsed < FRAME_INTERVAL:
+                time.sleep(FRAME_INTERVAL - elapsed)
+                continue
+
+            if capture is None:
+                _broadcast(out_sock, {
+                    "waypoints": [], "ball": None, "player": None,
+                    "turn_detected": False, "hibernating": False,
+                })
+                time.sleep(FRAME_INTERVAL)
+                last_frame_t = time.monotonic()
+                continue
+
+            frame = capture.acquire_bgr()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            result = analyse_frame(frame, cfg_h[0])
+            result["turn_detected"] = result.get("player") is not None
+            result["hibernating"]   = False
+            _broadcast(out_sock, result)
+            last_frame_t = time.monotonic()
+
+    except KeyboardInterrupt:
+        Logger.info("SoccerStarsService: interrupted.")
+    finally:
+        stop_ev.set()
+        if capture:
+            capture.stop()
+        out_sock.close()
+        Logger.info("SoccerStarsService: stopped.")
+
 
 if __name__ == "__main__":
-    SoccerStarsApp().run()
+    main()
